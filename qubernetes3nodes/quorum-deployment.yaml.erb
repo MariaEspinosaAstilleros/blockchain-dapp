@@ -1,0 +1,379 @@
+#<%- File.readlines("#{@Keystore_Dir}/#{@Node_Key_Dir}/enode").each do |line| -%><%= line -%><% end -%>
+<%
+@Service_Prefix = (@Node_UserIdent.upcase).gsub("-", "_")
+@Geth_Verbosity        = @config["geth"]["verbosity"]
+@Geth_Network_Id       = @config["geth"]["network"]["id"]
+@Node_WSPort           = @config["geth"]["Node_WSPort"]
+@NodeP2P_ListenAddr    = @config["geth"]["NodeP2P_ListenAddr"]
+
+if @config["geth"]["Geth_Startup_Params"]
+  @Geth_Startup_Params   = @config["geth"]["Geth_Startup_Params"]
+else
+  @Geth_Startup_Params   = ""
+end
+
+@Node_DataDir          = @config["quorum"]["Node_DataDir"]
+@Quorum_Version        = @config["quorum"]["quorum"]["Quorum_Version"]
+@Tm_Version            = @config["quorum"]["tm"]["Tm_Version"]
+@Tm_Port               = @config["quorum"]["tm"]["Port"]
+@Tm_Name               = @config["quorum"]["tm"]["Name"]
+
+# Storage for data directories, default host with default DataDir (hostPath).
+@Storage_Type          = "Host"
+@DataDir               = "/var/lib/docker/geth-storage"
+if @config["quorum"]["Data_Dir"]
+    @DataDir = @config["quorum"]["Data_Dir"]
+end
+# if storage is set set up the appropriate storage variable (host or PVC)
+if @config["quorum"]["storage"]
+  if @config["quorum"]["storage"]["Type"] == "Host"
+    @Storage_Type = "Host"
+    if @config["quorum"]["storage"]["Data_Dir"]
+      @DataDir = @config["quorum"]["storage"]["Data_Dir"]
+    end
+  # Persistent_Volume_Claim
+  elsif @config["quorum"]["storage"]["Type"] == "PVC"
+    @Storage_Type = "PVC"
+  end
+end
+%>
+
+# The quorum deployment consists of
+# 1. the transaction manager / private tx container (constellation or tessera)
+# 2. the quorum node container
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: <%= @Node_UserIdent %>-deployment
+  <%= @Namespace %>
+spec:
+  strategy:
+    type: RollingUpdate
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qubernetes
+  template:
+    metadata:
+      name:  <%= @Node_UserIdent %>-deployment
+      labels:
+        app: qubernetes
+        tier: backend
+        name: <%= @Node_UserIdent %>-deployment
+    spec:
+      initContainers:
+      - name: quorum-genesis-init-container
+        image: quorumengineering/quorum:<%= @Quorum_Version %>
+        command: [ "sh" ]
+        args:
+        - "-cx"
+        - "if [ ! -f $QUORUM_DATA_DIR/genesis_created ]; then
+              /usr/local/bin/geth --datadir $QUORUM_DATA_DIR init /etc/quorum/genesis/genesis-geth.json;
+              date > $QUORUM_DATA_DIR/genesis_created;
+           fi;
+           cp -r <%= @Node_DataDir %>/contracts-tmp <%= @Node_DataDir %>/contracts;
+           chmod 755  <%= @Node_DataDir %>/contracts/runscript.sh;
+           chmod 755  <%= @Node_DataDir %>/contracts/raft_add_all_permissioned.sh;
+           chmod 755  <%= @Node_DataDir %>/contracts/raft_add_node.sh;
+          "
+        env:
+          - name: QUORUM_DATA_DIR
+            value: <%= @Node_DataDir %>/dd
+          - name: QHOME
+            value: <%= @Node_DataDir %>
+        volumeMounts:
+        - name: quorum-persistent-storage
+          mountPath:  <%= @Node_DataDir %>
+        - name: genesis-config-persistent-storage
+          mountPath: /etc/quorum/genesis/genesis-geth.json
+          subPath: genesis-geth.json
+        - name: contracts-config
+          mountPath: <%= @Node_DataDir%>/contracts-tmp
+          readOnly: false
+      containers:
+    <% if @Tm_Name == "constellation"  %>
+      - name: constellation
+        image: quorumengineering/constellation:<%= @Tm_Version %>
+        command: ["sh"]
+        args:
+        - "-cx"
+        - "chmod 600 $QUORUM_HOME/tm/tm.key;
+           DDIR=$QUORUM_HOME/tm;
+           printenv;
+           args=\" --url=https://$<%= @Service_Prefix %>_SERVICE_HOST:<%= @Tm_Port %>/  \
+           --port=<%= @Tm_Port %> \
+           --workdir=$DDIR \
+           --socket=$DDIR/tm.ipc \
+           --publickeys=$QUORUM_HOME/tm/tm.pub \
+           --privatekeys=$QUORUM_HOME/tm/tm.key \
+           --verbosity=<%= @Geth_Verbosity%> \
+           --othernodes=https://$QUORUM_NODE1_SERVICE_HOST:<%= @Tm_Port %>/ \";
+           /usr/local/bin/constellation-node $args  2>&1 | tee -a $QUORUM_HOME/logs/tm.log; "
+     <% else %>
+      - name: tessera
+        image: quorumengineering/tessera:<%= @Tm_Version %>
+        command: ["sh"]
+        args:
+        - "-cx"
+        - "chmod 600 $QUORUM_HOME/tm/tm.key;
+           echo DDIR is $DDIR;
+           printenv;
+
+           TESSERA_VERSION=$(unzip -p /tessera/tessera-app.jar META-INF/MANIFEST.MF | grep Tessera-Version | cut -d\" \" -f2);
+           echo \"Tessera version (extracted from manifest file): ${TESSERA_VERSION}\";
+
+           TESSERA_VERSION=\"${TESSERA_VERSION}-suffix\";
+           Tess_Ver_First=$(echo ${TESSERA_VERSION} | awk -F. '{print $1}');
+           Tess_Ver_Second=$(echo ${TESSERA_VERSION} | awk -F. '{print $2}');
+           Tess_Ver_Third=$(echo ${TESSERA_VERSION} | awk -F. '{print $3}');
+           echo \"version: first [$Tess_Ver_First], second [$Tess_Ver_Second], third [$Tess_Ver_Third]\";
+           echo \"Tessera version - suffix ${TESSERA_VERSION}\";
+           TESSERA_CONFIG_TYPE=;
+
+           if [ \"${Tess_Ver_Second}\" -ge \"8\" ]; then TESSERA_CONFIG_TYPE=\"-enhanced\"; fi;
+           if [[ \"${Tess_Ver_Second}\" -ge \"9\" ]]; then TESSERA_CONFIG_TYPE=\"-9.0\"; fi;
+
+           echo Config type [${TESSERA_CONFIG_TYPE}];
+
+           CONFIG_TMPL=$(cat ${DDIR}/tessera-config${TESSERA_CONFIG_TYPE}.json.tmpl);
+
+           <%- @This_Host = ("#{@Node_UserIdent}".upcase + "_SERVICE_HOST").gsub("-", "_") -%>
+           echo  \"<%= @Sed_Set_Node_Service_Host %>\";
+           CONFIG_WITH_OTHER_HOSTS=$(echo $CONFIG_TMPL | <%= @Sed_Set_Node_Service_Host %>) ;
+           CONFIG_WITH_ALL_HOSTS=$(echo $CONFIG_WITH_OTHER_HOSTS | sed \"s/%THIS_SERVICE_HOST%/$<%= @This_Host %>/g\");
+           PRIV_KEY=$(cat $DDIR/tm.key)
+           PUB_KEY=$(cat $DDIR/tm.pub)
+           CONFIG_FINAL=$(echo $CONFIG_WITH_ALL_HOSTS | sed \"s-%THIS_PRIV_KEY%-${PRIV_KEY}-g\" |  sed \"s-%THIS_PUB_KEY%-${PUB_KEY}-g\");
+           CONFIG_FINAL_9_0=$(echo $CONFIG_WITH_ALL_HOSTS | sed \"s-%THIS_PRIV_KEY%-${DDIR}/tm.key-g\" |  sed \"s-%THIS_PUB_KEY%-${DDIR}/tm.pub-g\");
+           if [[ \"${Tess_Ver_Second}\" -ge \"9\" ]]; then CONFIG_FINAL=${CONFIG_FINAL_9_0}; fi;
+           echo $CONFIG_FINAL >  ${DDIR}/tessera-config-with-hosts.json;
+           cat  ${DDIR}/tessera-config-with-hosts.json;
+           java -Xms128M -Xmx128M -jar /tessera/tessera-app.jar -configfile ${DDIR}/tessera-config-with-hosts.json | tee -a ${QHOME}/logs/tessera.log;
+        "
+     <%- end %>
+        ports:
+          - containerPort: <%= @Tm_Port %>
+        env:
+          - name: QHOME
+            value: <%= @Node_DataDir %>
+          - name: QUORUM_HOME
+            value: <%= @Node_DataDir %>
+          - name: DDIR
+            value: <%= @Node_DataDir %>/tm
+        volumeMounts:
+        - name: quorum-logs-persistent-storage
+          mountPath: <%= @Node_DataDir %>/logs
+        - name: tm-persistent-storage
+          mountPath: <%= @Node_DataDir %>/tm
+        - name: quorum-persistent-storage
+          mountPath: <%= @Node_DataDir %>
+        - name: keystore-tm
+          mountPath: <%= @Node_DataDir %>/tm/tm.pub
+          subPath: tm.pub
+        - name: keystore-tm
+          mountPath: <%= @Node_DataDir %>/tm/tm.key
+          subPath: tm.key
+        - name: tessera-config
+          mountPath: <%= @Node_DataDir %>/tm/tessera-config.json.tmpl
+          subPath: tessera-config.json.tmpl
+        - name: tessera-config
+          mountPath: <%= @Node_DataDir %>/tm/tessera-config-enhanced.json.tmpl
+          subPath: tessera-config-enhanced.json.tmpl
+        - name: tessera-config
+          mountPath: <%= @Node_DataDir %>/tm/tessera-config-9.0.json.tmpl
+          subPath: tessera-config-9.0.json.tmpl
+      - name: quorum
+        image: quorumengineering/quorum:<%= @Quorum_Version %>
+        command: [ "sh" ]
+        # TODO: have to generate sed files
+        #       PERM_NODE_JSON=$(echo $PERM_NODE_TMPL | sed \"s/%QUORUM-NODE01_SERVICE_HOST%/$QUORUM_NODE01_SERVICE_HOST/g\" | sed \"s/%QUORUM-NODE02_SERVICE_HOST%/$QUORUM_NODE02_SERVICE_HOST/g\");
+        # sleep to give constellation some time to start up and discover the other nodes.
+        #  --maxpeers <%= @nodes.size %>
+        args:
+        - "-cx"
+        - "
+           apk add curl;
+           apk add jq;
+           until $(curl --output /dev/null --silent --head --fail http://127.0.0.1:<%= @Tm_Port %>/upcheck); do echo 'waiting for transaction manager to start...'; sleep 5; done;
+           echo transaction manager is up;
+           sh $QHOME/permission-nodes/permissioned-update.sh;
+
+           rm -r <%= @Node_DataDir %>/contracts-tmp;
+
+           echo what in this dir;
+           ls  $QUORUM_DATA_DIR;
+           cat /etc/quorum/genesis/genesis-geth.json;
+
+           chmod 644 $QUORUM_DATA_DIR/keystore/key;
+           touch $QUORUM_DATA_DIR/password.txt;
+           NETWORK_ID=<%= @Geth_Network_Id %>
+         <% if @config["quorum"]["consensus"] == "raft" %>
+           args=\" --gcmode archive --raft  --raftport <%= @Raft_Port %> --rpcapi admin,db,eth,debug,miner,net,shh,txpool,personal,web3,quorum,raft \";
+         <% elsif @config["quorum"]["consensus"] == "istanbul" %>
+           args=\" --gcmode archive --istanbul.blockperiod 3  --syncmode full --mine --minerthreads 1 --rpcapi admin,db,eth,debug,miner,net,shh,txpool,personal,web3,quorum,istanbul \";
+         <% else %>
+           args=\"--rpcapi admin,db,eth,debug,miner,net,shh,txpool,personal,web3,quorum \";
+         <% end %>
+           /usr/local/bin/geth \
+           --datadir $QUORUM_DATA_DIR \
+           $args \
+           --permissioned \
+           --nodiscover \
+           --nat=none \
+           --verbosity <%= @Geth_Verbosity %> \
+           --networkid $NETWORK_ID \
+           --unlock 0 \
+           --emitcheckpoints \
+           --rpc \
+           --rpcaddr 0.0.0.0 \
+           --rpcport <%= @Node_WSPort %> \
+           --port <%= @NodeP2P_ListenAddr %> \
+           <%= @Geth_Startup_Params %> \
+           --password $QUORUM_DATA_DIR/password.txt 2>&1 | tee -a <%= @Node_DataDir%>/logs/quorum.log;"
+        ports:
+          - containerPort: <%= @Raft_Port %>
+          - containerPort: <%= @Node_WSPort %>
+          - containerPort: <%= @NodeP2P_ListenAddr %>
+        env:
+        - name: PRIVATE_CONFIG
+          value: <%= @Node_DataDir %>/tm/tm.ipc
+        - name: QUORUM_DATA_DIR
+          value: <%= @Node_DataDir %>/dd
+        - name: QUORUM_HOME
+          value: <%= @Node_DataDir %>
+        - name: QHOME
+          value: <%= @Node_DataDir %>
+        - name: TM_HOME
+          value: <%= @Node_DataDir %>/tm/
+        - name: THIS_NODE_ID
+          value: <%= @Node_UserIdent%>
+        - name: THIS_ENODE
+          value: <%- File.readlines("#{@Keystore_Dir}/#{@Node_Key_Dir}/enode").each do |line| -%><%= line -%><% end -%>
+        volumeMounts:
+        - name: genesis-config-persistent-storage
+          mountPath: /etc/quorum/genesis/genesis-geth.json
+          subPath: genesis-geth.json
+        - name: quorum-persistent-storage
+          mountPath: <%= @Node_DataDir%>
+        - name: tm-persistent-storage
+          mountPath: <%= @Node_DataDir%>/tm
+        - name: quorum-key-config-persistent-storage
+          mountPath: <%= @Node_DataDir%>/dd/keystore/key
+          subPath: key
+        - name: quorum-logs-persistent-storage
+          mountPath: <%= @Node_DataDir %>/logs
+        - name: quorum-nodekey
+          mountPath: <%= @Node_DataDir%>/dd/geth/nodekey
+          subPath: nodekey
+        - name: quorum-enode
+          mountPath: <%= @Node_DataDir%>/dd/geth/enode
+          subPath: enode
+        - name: quorum-permissioned-config
+          mountPath: <%= @Node_DataDir%>/permission-nodes
+        <% if @config["quorum"]["consensus"] == "istanbul" %>
+        - name: istanbul-validator-config
+          mountPath: <%= @Node_DataDir%>/istanbul-validator-config.toml
+        - name: node-management
+          mountPath: <%= @Node_DataDir%>/node-management/ibft_propose.sh
+          subPath: ibft_propose.sh
+        - name: node-management
+          mountPath: <%= @Node_DataDir%>/node-management/ibft_propose_all.sh
+          subPath: ibft_propose_all.sh
+        <% end %>
+          #subPath: permissioned-nodes.json
+       # - name: quorum-permissioned-config
+       #   mountPath: <%= @Node_DataDir%>/dd/static-nodes.json.tmpl
+       #   subPath: permissioned-nodes.json
+      volumes:
+      - name: quorum-permissioned-config
+        configMap:
+          name: quorum-permissioned-config
+          items:
+          - key: permissioned-nodes.json
+            path: permissioned-nodes.json.tmpl
+          - key: permissioned-update.sh
+            path: permissioned-update.sh
+      - name: genesis-config-persistent-storage
+        configMap:
+          name: genesis-config
+          items:
+          - key: genesis-geth.json
+            path: genesis-geth.json
+      - name: tessera-config
+        configMap:
+          name: tessera-config
+          items:
+          - key: tessera-config.json.tmpl
+            path: tessera-config.json.tmpl
+          - key: tessera-config-enhanced.json.tmpl
+            path: tessera-config-enhanced.json.tmpl
+          - key: tessera-config-9.0.json.tmpl
+            path: tessera-config-9.0.json.tmpl
+      - name: contracts-config
+        configMap:
+          name: contracts-config
+      - name: keystore-tm
+        configMap:
+          name: <%= @Node_UserIdent %>-tm-key-config
+          items:
+          - key: tm.pub
+            path: tm.pub
+          - key: tm.key
+            path: tm.key
+      - name: quorum-key-config-persistent-storage
+        configMap:
+          name: <%= @Node_UserIdent %>-account-key-config
+          items:
+          - key: key
+            path: key
+      - name: quorum-nodekey
+        configMap:
+          name: <%= @Node_UserIdent %>-nodekey-config
+          items:
+          - key: nodekey
+            path: nodekey
+      - name: quorum-enode
+        configMap:
+          name: <%= @Node_UserIdent %>-enode-config
+          items:
+            - key: enode
+              path: enode
+      <% if @config["quorum"]["consensus"] == "istanbul" %>
+      - name: istanbul-validator-config
+        configMap:
+          name: istanbul-validator-config.toml
+      - name: node-management
+        configMap:
+           name: node-management
+           items:
+           - key: ibft_propose.sh
+             path: ibft_propose.sh
+           - key: ibft_propose_all.sh
+             path: ibft_propose_all.sh
+           defaultMode: 0777
+      <% end %>
+      # PVC (configurable) https://kubernetes.io/docs/concepts/storage/persistent-volumes/#claims-as-volumes
+     <% if @Storage_Type == "PVC" %>
+      - name: quorum-persistent-storage
+        persistentVolumeClaim:
+          claimName: <%= @Node_UserIdent %>-quorum
+      - name: tm-persistent-storage
+        persistentVolumeClaim:
+          claimName: <%= @Node_UserIdent %>-tm-pvc
+      - name: quorum-logs-persistent-storage
+        persistentVolumeClaim:
+          claimName: <%= @Node_UserIdent %>-log-pvc
+      # default is Host if not set.
+      <% else %>
+      - name: quorum-persistent-storage
+        hostPath:
+          path: <%= @DataDir%>/<%= @Node_UserIdent %>
+      - name: tm-persistent-storage
+        hostPath:
+          path: <%= @DataDir%>/tm-<%= @Node_UserIdent %>
+      - name: quorum-logs-persistent-storage
+        hostPath:
+          path: <%= @DataDir%>/<%= @Node_UserIdent %>-logs
+      <% end %>
